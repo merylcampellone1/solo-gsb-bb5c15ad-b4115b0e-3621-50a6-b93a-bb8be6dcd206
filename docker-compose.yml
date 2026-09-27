@@ -1,0 +1,17 @@
+services:
+  minimizer:
+    build: .
+    image: schema-counterexample-minimizer:latest
+    container_name: schema-counterexample-minimizer
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # 容器内监听地址
+      HOST: 0.0.0.0
+      # 容器内监听端口（左侧宿主机映射端口由顶层 PORT 控制）
+      PORT: 8000
+      # 请求未显式指定 max_evaluations 时使用的默认值
+      DEFAULT_MAX_EVALUATIONS: ${DEFAULT_MAX_EVALUATIONS:-1000}
+      # 单次请求允许的评估次数硬上限
+      HARD_MAX_EVALUATIONS: ${HARD_MAX_EVALUATIONS:-100000}
+    restart: unless-stopped
