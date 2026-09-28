@@ -1,12 +1,15 @@
 # JSON Schema 反例最小化 API
 
-基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供两个接口：
+基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供三个接口：
 
 - **`POST /minimize`**：给定 JSON Schema 和一个**未通过校验**的实例，做确定性
   delta debugging 最小化，锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；
 - **`POST /mutations`**：给定 JSON Schema 和一个**合法样例**，确定性生成覆盖
   `required` / `type` / `minItems` / `minLength` / 数值边界 / `enum` 等约束的
-  **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed。
+  **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed；
+- **`POST /schema-diff`**：给定**旧版、新版**两个 JSON Schema 与一个 JSON 实例，
+  返回两版各自的通过/拒绝状态与首个错误；结果相反时沿用 `/minimize` 的确定性
+  缩减步骤找出更小的**差异见证**（每个候选都必须保持两版通过/拒绝组合）。
 
 `/minimize` 的工作流程：
 
@@ -31,6 +34,18 @@
 3. 每个候选都用真实校验器验证：**只有首个校验错误的关键字与预期一致才被接受**
    （与 `/minimize` 的锁定语义一致），无法构造的关键字列入 `skipped`；
 4. 同一变异实例去重，每个变异返回 JSON Pointer、预期触发关键字和可复现 seed。
+
+`/schema-diff` 的工作流程：
+
+1. 分别用旧版、新版 schema 对原实例各校验一次，返回两版的**通过/拒绝状态**与
+   **首个错误**（关键字、JSON Pointer、错误信息）；
+2. 两版结果相同（都通过或都拒绝）时**不缩减**，`minimal_instance` 为 `null`；
+3. 两版结果相反（一通过、一拒绝）时，沿用 `/minimize` 的确定性缩减步骤
+   （坍缩 → 标量阶梯 → 字段/区间/字符块 ddmin → 递归不动点），但“有趣性”
+   判据换成 **候选必须保持原实例的 `(旧版状态, 新版状态)` 组合**——任一版的
+   通过/拒绝发生翻转（包括两边都拒绝/都通过）即丢弃候选；
+4. 返回最小差异见证、差异方向（`new_rejects` / `new_accepts`）、双版评估
+   次数与预算中止标记。
 
 整个过程不使用任何随机源，相同输入必然得到相同结果（依赖版本已锁定）。
 
@@ -196,6 +211,70 @@ docker compose up --build -d   # 然后访问 http://localhost:9000
 
 ---
 
+### `POST /schema-diff`
+
+给定**旧版、新版**两个 JSON Schema 与一个 JSON 实例，对比两版的通过/拒绝
+结果；结果相反时确定性缩减出更小的差异见证。
+
+请求体：
+
+| 字段              | 类型             | 必填 | 说明                                                                 |
+| ----------------- | ---------------- | ---- | -------------------------------------------------------------------- |
+| `old_schema`      | object / boolean | 是   | 旧版 JSON Schema（支持 Draft 3/4/6/7/2019-09/2020-12，含布尔 schema）|
+| `new_schema`      | object / boolean | 是   | 新版 JSON Schema（同上）                                             |
+| `instance`        | 任意 JSON        | 是   | 待对比的 JSON 实例                                                   |
+| `max_evaluations` | integer          | 否   | 最大双版评估次数（**含对原实例的首次双版校验**），默认/上限见配置表，≥ 1 |
+
+> 一次“评估”指对一个候选在旧版、新版上**各执行一次完整 JSON 校验**；
+> 缩减步骤与 `/minimize` 完全相同，唯一区别是候选的接受条件为
+> **保持两版通过/拒绝组合**。
+
+#### 响应 `200`
+
+| 字段                 | 说明                                                                       |
+| -------------------- | -------------------------------------------------------------------------- |
+| `old` / `new`        | 两版对**原实例**的结果侧结构（见下）                                       |
+| `diverges`           | 两版结果是否相反（一通过、一拒绝）                                         |
+| `direction`          | 差异方向：`new_rejects`（旧通过/新拒绝）、`new_accepts`（旧拒绝/新通过）；不相反时为 `null` |
+| `minimal_instance`   | 最小差异见证；两版结果相同（不缩减）时为 `null`                            |
+| `original_instance`  | 原始实例（原样回显）                                                       |
+| `evaluations`        | 实际消耗的双版评估次数                                                     |
+| `stopped_by_budget`  | `true` 表示在到达不动点前因预算耗尽提前停止                                |
+| `trace[]`            | 每一次双版评估的轨迹（见下）                                               |
+
+`old` / `new` 侧结构字段：
+
+| 字段         | 说明                                                            |
+| ------------ | --------------------------------------------------------------- |
+| `status`     | `pass` / `reject`                                               |
+| `keyword`    | 首个错误关键字；该版通过时为 `null`（布尔 `false` schema 下亦为 `null`） |
+| `error_path` | 首个错误对象所在位置的 JSON Pointer（根为 `""`），通过时为 `null` |
+| `message`    | 校验器给出的错误信息，通过时为 `null`                           |
+
+`trace[]` 条目字段：
+
+| 字段    | 说明                                                                       |
+| ------- | -------------------------------------------------------------------------- |
+| `index` | 评估序号，从 1 开始（第 1 条恒为 `lock`）                                  |
+| `op`    | 操作类型：`lock` / `collapse` / `scalar` / `ddmin-object` / `ddmin-array` / `ddmin-string` |
+| `path`  | 被修改节点的 JSON Pointer（根为 `""`）                                     |
+| `detail`| 人类可读的操作描述                                                         |
+| `kept`  | 候选是否保持了原实例的两版通过/拒绝组合并被接受为新的当前实例              |
+| `old` / `new` | 候选在两版上各自的侧结构（同上；若校验器对该候选无法运行则为 `status: "error"`） |
+
+#### 错误响应（均为 `422`）
+
+- 任一 schema 自身不合法或无法用于校验（如坏 `$ref`）：
+
+  ```json
+  { "error": "invalid_schema", "which": "new_schema", "message": "...", "path": [] }
+  ```
+
+  `which` 取值为 `old_schema` 或 `new_schema`，指明是哪一版有问题。
+- 请求体缺少必填字段、`max_evaluations` 越界等：FastAPI/Pydantic 标准 422 结构。
+
+---
+
 ## 使用示例
 
 ```bash
@@ -289,19 +368,88 @@ for m in r.json()["mutations"]:
 #  minLength 'he' <seed>
 ```
 
+### `/schema-diff` 示例
+
+旧版要求对象必须有 `id`，新版取消了该约束——原实例在两版下结果相反
+（旧拒绝 / 新通过，`new_accepts`），缩减时每个候选都必须保持这一组合：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_schema": {"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}},
+    "new_schema": {},
+    "instance": {"tags": ["aaaaaaaaaa", "bbbbbbbbbb"], "extra": {"deep": [1,2,3,4]}},
+    "max_evaluations": 100
+  }'
+```
+
+响应（节选）：空对象在旧版下仍缺 `id`、在新版下通过；进一步坍缩成 `null`
+后旧版依旧拒绝、新版依旧通过，组合保持不变，故最小见证为 `null`，全程 3 次评估：
+
+```json
+{
+  "old": {"status": "reject", "keyword": "required", "error_path": "", "message": "'id' is a required property"},
+  "new": {"status": "pass", "keyword": null, "error_path": null, "message": null},
+  "diverges": true,
+  "direction": "new_accepts",
+  "minimal_instance": null,
+  "evaluations": 3,
+  "stopped_by_budget": false
+}
+```
+
+反方向的例子：旧版只要求数组，新版增加 `minItems: 3`。实例 `[10, 20]`
+旧版通过、新版拒绝（`new_rejects`）；`[]` 仍保持该组合，而 `null` 会让
+旧版也拒绝（组合被破坏），故最小见证是 `[]`：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_schema": {"type":"array"},
+    "new_schema": {"type":"array","minItems":3},
+    "instance": [10, 20]
+  }'
+```
+
+两版结果相同（都通过或都拒绝）时不缩减：响应中 `diverges` 为 `false`、
+`direction` 与 `minimal_instance` 均为 `null`，只消耗 1 次评估。
+
+Python 调用：
+
+```python
+import httpx
+
+r = httpx.post(
+    "http://localhost:8000/schema-diff",
+    json={
+        "old_schema": {"type": "object", "required": ["id"]},
+        "new_schema": {"type": "object"},
+        "instance": {"tags": ["a", "b"]},
+    },
+)
+data = r.json()
+print(data["old"]["status"], data["new"]["status"])  # reject pass
+print(data["direction"], data["minimal_instance"])    # new_accepts None
+```
+
 ---
 
 ## 算法说明（确定性保证）
 
 1. **锁定**：首次校验取 `jsonschema` 校验器产出的第一个错误，记录其
-   `validator`（即关键字）作为唯一"有趣性"判据。
+   `validator`（即关键字）作为唯一"有趣性"判据。`/schema-diff` 不锁定
+   关键字：首次在旧版、新版上各校验一次，以**两版通过/拒绝组合**为唯一
+   判据，缩减过程中组合翻转的候选一律丢弃。
 2. **遍历策略**：对每个节点依次执行「坍缩 → 标量阶梯 → 本层 ddmin → 递归子节点」。
    任何被接受的修改都严格减小实例的良基复杂度（容器元素数 / 标量量级），
    因此外层不动点迭代必然终止，不会出现 `1 ↔ -1` 之类的振荡。
 3. **ddmin**：对象按键的插入序、数组/字符串按位置切成尽量等长的连续块，
    先逐块删除，再尝试只保留单个块，粒度 `n` 按经典算法
    `2 → … → 元素数` 自适应增减。
-4. **预算**：每执行一次完整 JSON 校验计 1 次评估（含锁定）。开始第
+4. **预算**：每执行一次完整 JSON 校验计 1 次评估（`/schema-diff` 对一个候选
+   做旧版、新版两次校验，合计为 1 次双版评估）。开始第
    `max_evaluations + 1` 次评估前立即停止并把 `stopped_by_budget` 置为 `true`，
    已接受的缩减全部保留。
 
@@ -335,9 +483,11 @@ python -m pytest -q
 ├── app/
 │   ├── main.py             # FastAPI 应用、请求/响应模型、配置
 │   ├── minimizer.py        # 确定性 delta debugging 最小化内核
+│   ├── differ.py           # 两版 schema 差异见证最小化（/schema-diff，复用 minimizer）
 │   └── mutator.py          # 确定性约束变异生成器（/mutations）
 ├── tests/
 │   ├── test_api.py         # /minimize 单元与端到端测试
+│   ├── test_schema_diff.py # /schema-diff 单元与端到端测试
 │   └── test_mutations.py   # /mutations 单元与端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
