@@ -1,12 +1,16 @@
 # JSON Schema 反例最小化 API
 
-基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供两个接口：
+基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供三个接口：
 
 - **`POST /minimize`**：给定 JSON Schema 和一个**未通过校验**的实例，做确定性
   delta debugging 最小化，锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；
 - **`POST /mutations`**：给定 JSON Schema 和一个**合法样例**，确定性生成覆盖
   `required` / `type` / `minItems` / `minLength` / 数值边界 / `enum` 等约束的
-  **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed。
+  **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed；
+- **`POST /schema-diff`**：给定**旧版、新版**两版 JSON Schema 与同一个 JSON 实例，
+  返回两版各自的通过/拒绝状态与首个错误；若两版结果**相反**，复用同一套确定性
+  缩减步骤寻找更小的**差异见证**（每个候选都必须保持旧版通过、新版拒绝，
+  或旧版拒绝、新版通过的原始组合），输出缩减实例、差异方向、评估次数与预算中止标记。
 
 `/minimize` 的工作流程：
 
@@ -31,6 +35,19 @@
 3. 每个候选都用真实校验器验证：**只有首个校验错误的关键字与预期一致才被接受**
    （与 `/minimize` 的锁定语义一致），无法构造的关键字列入 `skipped`；
 4. 同一变异实例去重，每个变异返回 JSON Pointer、预期触发关键字和可复现 seed。
+
+`/schema-diff` 的工作流程：
+
+1. 先对旧版、新版分别做一次完整校验（共 2 次评估），记录两版各自的通过/拒绝
+   状态与首个错误；任一 schema 自身无效即返回 422（并标明 `old` / `new`）；
+2. 两版结果**相同**（都通过或都拒绝）时不存在行为差异，直接回显原实例、
+   `differs: false`，**不做任何缩减**；
+3. 两版结果**相反**时进入与 `/minimize` 完全相同的确定性缩减流程（坍缩 /
+   标量阶梯 / ddmin 删块 / 递归不动点），但有趣性判据换成**两版的通过/拒绝
+   组合**：候选只有在仍然一边通过、一边拒绝时才被接受（不要求首个错误关键字
+   保持不变）；
+4. 返回最小差异见证、差异方向（`newly_rejected` 旧版通过→新版拒绝，
+   或 `newly_accepted` 旧版拒绝→新版通过）、实际评估次数与预算中止标记。
 
 整个过程不使用任何随机源，相同输入必然得到相同结果（依赖版本已锁定）。
 
@@ -196,7 +213,66 @@ docker compose up --build -d   # 然后访问 http://localhost:9000
 
 ---
 
-## 使用示例
+### `POST /schema-diff`
+
+给定**旧版、新版**两版 JSON Schema 与同一个 JSON 实例，比较两版校验结果；
+结果相反时做确定性差异见证（differential witness）最小化。
+
+请求体：
+
+| 字段              | 类型             | 必填 | 说明                                                                 |
+| ----------------- | ---------------- | ---- | -------------------------------------------------------------------- |
+| `old_schema`      | object / boolean | 是   | 旧版 JSON Schema（支持 Draft 3/4/6/7/2019-09/2020-12，含布尔 schema）|
+| `new_schema`      | object / boolean | 是   | 新版 JSON Schema（draft 可与旧版不同，各自按 `$schema` 识别）        |
+| `instance`        | 任意 JSON        | 是   | 在两版上分别校验的同一个 JSON 实例（无需预知它是否合法）             |
+| `max_evaluations` | integer          | 否   | 最大**完整 JSON 校验**次数；每个候选需旧版、新版各校验一次，故 ≥ 2   |
+
+#### 响应 `200`
+
+| 字段                 | 说明                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| `differs`            | 两版结果是否相反；`false` 时不缩减，`reduced_instance` 即原实例      |
+| `direction`          | 差异方向：`newly_rejected`（旧版通过、新版拒绝，新版变严）/ `newly_accepted`（旧版拒绝、新版通过，新版变松）；无差异时为 `null` |
+| `old_valid` / `new_valid` | 旧版 / 新版对**缩减后实例**的通过状态（无差异时即原实例的状态） |
+| `old_first_error` / `new_first_error` | 各自首个错误（结构同下）；该版通过时为 `null`            |
+| `reduced_instance`   | 差异见证缩减结果（无差异时原样回显）                                 |
+| `original_instance`  | 原始实例（原样回显）                                                 |
+| `evaluations`        | 实际消耗的完整 JSON 校验次数（锁定 2 次 + 每候选 2 次）              |
+| `stopped_by_budget`  | `true` 表示在到达不动点前因预算耗尽提前停止（已接受缩减全部保留）    |
+| `trace[]`            | 每个候选的评估轨迹（无差异时为空列表）                               |
+
+`old_first_error` / `new_first_error` 条目字段：
+
+| 字段            | 说明                                       |
+| --------------- | ------------------------------------------ |
+| `keyword`       | 首个错误的校验关键字（布尔 `false` 下为 `null`）|
+| `instance_path` | 错误实例位置的 JSON Pointer（根为 `""`）   |
+| `schema_path`   | 错误对应 schema 子句位置的 JSON Pointer    |
+| `message`       | 校验器给出的错误信息                       |
+
+`trace[]` 条目字段：
+
+| 字段            | 说明                                                                 |
+| --------------- | -------------------------------------------------------------------- |
+| `index`         | 候选序号，从 1 开始（锁定校验不计入候选；评估总额见 `evaluations`）   |
+| `op`            | 与 `/minimize` 相同：`collapse` / `scalar` / `ddmin-object` / `ddmin-array` / `ddmin-string` |
+| `path`          | 被修改节点的 JSON Pointer（根为 `""`）                               |
+| `detail`        | 人类可读的操作描述                                                   |
+| `kept`          | 该候选是否保持原始的两版通过/拒绝组合并被接受为新的当前实例          |
+| `old_valid` / `new_valid` | 候选在旧版 / 新版上是否通过                                  |
+| `old_keyword` / `new_keyword` | 候选在两版上各自触发的首个错误关键字；该版通过时为 `null`   |
+
+#### 错误响应（均为 `422`）
+
+- 任一 schema 自身不合法（或实际校验时不可用，如坏 `$ref`）：
+
+  ```json
+  { "error": "invalid_schema", "side": "new", "message": "...", "path": ["type"] }
+  ```
+
+  `side` 为 `"old"` 或 `"new"`，标明无效的是哪一版。
+- 请求体缺少必填字段、`max_evaluations` 越界（`< 2` 或超过硬上限）等：
+  FastAPI/Pydantic 标准 422 结构。
 
 ```bash
 curl -s -X POST http://localhost:8000/minimize \
@@ -289,6 +365,93 @@ for m in r.json()["mutations"]:
 #  minLength 'he' <seed>
 ```
 
+### `/schema-diff` 示例
+
+新版把数组下限从 2 收紧到 3：`[10, 20]` 旧版通过、新版拒绝。长度不能再删
+（长度 1 时旧版也会拒绝），于是元素坍缩为 `null`，见证缩为 `[null, null]`：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_schema": {"type":"array","minItems":2},
+    "new_schema": {"type":"array","minItems":3},
+    "instance": [10, 20]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "differs": true,
+  "direction": "newly_rejected",
+  "old_valid": true,
+  "new_valid": false,
+  "old_first_error": null,
+  "new_first_error": {
+    "keyword": "minItems",
+    "instance_path": "",
+    "schema_path": "/minItems",
+    "message": "[None, None] is too short"
+  },
+  "reduced_instance": [null, null],
+  "original_instance": [10, 20],
+  "evaluations": 30,
+  "stopped_by_budget": false,
+  "trace": [
+    {"index": 1, "op": "collapse", "detail": "collapse array(2) -> []",
+     "kept": false, "old_valid": false, "new_valid": false,
+     "old_keyword": "minItems", "new_keyword": "minItems"}
+  ]
+}
+```
+
+反方向（新版变松）——旧版 `minLength: 3` 拒绝 `"hi"`，新版 `minLength: 1`
+接受；空串会让两版都拒绝而被丢弃，最终见证为单字符 `"h"`：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-diff \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_schema": {"type":"string","minLength":3},
+    "new_schema": {"type":"string","minLength":1},
+    "instance": "hi"
+  }'
+# -> {"differs": true, "direction": "newly_accepted",
+#     "old_valid": false, "new_valid": true,
+#     "old_first_error": {"keyword": "minLength", "instance_path": "", ...},
+#     "reduced_instance": "h", "evaluations": 12, "stopped_by_budget": false}
+```
+
+两版结果相同则不缩减（`evaluations` 只有锁定的 2 次）；任一 schema 无效
+返回 422 并标明版本：
+
+```bash
+curl -s -X POST http://localhost:8000/schema-diff \
+  -H 'Content-Type: application/json' \
+  -d '{"old_schema": {}, "new_schema": {"type":"nope"}, "instance": 1}'
+# 422 {"error":"invalid_schema","side":"new","message":"...","path":["type"]}
+```
+
+Python 调用：
+
+```python
+import httpx
+
+r = httpx.post(
+    "http://localhost:8000/schema-diff",
+    json={
+        "old_schema": {"type": "object", "required": ["id"]},
+        "new_schema": {"type": "object", "required": ["id", "name"]},
+        "instance": {"id": 1, "extra": [1, 2, 3]},
+    },
+)
+d = r.json()
+print(d["direction"], d["reduced_instance"])
+# newly_rejected {'id': None}
+```
+
 ---
 
 ## 算法说明（确定性保证）
@@ -301,9 +464,11 @@ for m in r.json()["mutations"]:
 3. **ddmin**：对象按键的插入序、数组/字符串按位置切成尽量等长的连续块，
    先逐块删除，再尝试只保留单个块，粒度 `n` 按经典算法
    `2 → … → 元素数` 自适应增减。
-4. **预算**：每执行一次完整 JSON 校验计 1 次评估（含锁定）。开始第
-   `max_evaluations + 1` 次评估前立即停止并把 `stopped_by_budget` 置为 `true`，
-   已接受的缩减全部保留。
+4. **预算**：每执行一次完整 JSON 校验计 1 次评估（`/minimize` 含锁定）。
+   开始第 `max_evaluations + 1` 次评估前立即停止并把 `stopped_by_budget`
+   置为 `true`，已接受的缩减全部保留。`/schema-diff` 每个候选要在两版上
+   各校验一次（2 次评估），锁定同样消耗 2 次，因此该接口的
+   `max_evaluations` 最小值为 2。
 
 注意：这里的"最小"是 **1-最小（1-minimal）** 意义上的最小——算法保证在其
 操作算子下再删任何一个单元都会丢失目标关键字，但不保证是全局基数最小。
@@ -333,12 +498,13 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py             # FastAPI 应用、请求/响应模型、配置
-│   ├── minimizer.py        # 确定性 delta debugging 最小化内核
+│   ├── main.py             # FastAPI 应用、请求/响应模型、配置（三个接口）
+│   ├── minimizer.py        # 确定性 delta debugging 最小化内核 + /schema-diff 双版差异见证
 │   └── mutator.py          # 确定性约束变异生成器（/mutations）
 ├── tests/
 │   ├── test_api.py         # /minimize 单元与端到端测试
-│   └── test_mutations.py   # /mutations 单元与端到端测试
+│   ├── test_mutations.py   # /mutations 单元与端到端测试
+│   └── test_schema_diff.py # /schema-diff 单元与端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .dockerignore

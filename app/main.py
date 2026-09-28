@@ -10,7 +10,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from jsonschema.exceptions import SchemaError
 
-from .minimizer import Minimizer, build_validator, pointer_from_path
+from .minimizer import (
+    Minimizer,
+    SchemaDiffMinimizer,
+    SchemaUnusable,
+    build_validator,
+    pointer_from_path,
+)
 from .mutator import Mutator
 
 # ---- 配置（全部可通过环境变量覆盖）----------------------------------------
@@ -25,7 +31,7 @@ app = FastAPI(
         "锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；"
         "也可以给定合法样例，确定性生成覆盖各类约束关键字的最小变异实例。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -185,4 +191,83 @@ def mutations(req: MutationsRequest) -> JSONResponse:
         )
 
     result = mutator.generate()
+    return JSONResponse(status_code=200, content=result.to_dict())
+
+
+class SchemaDiffRequest(BaseModel):
+    old_schema: Annotated[
+        Any,
+        Field(
+            alias="old_schema",
+            title="旧版 JSON Schema",
+            description="变更前的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+        ),
+    ]
+    new_schema: Annotated[
+        Any,
+        Field(
+            alias="new_schema",
+            title="新版 JSON Schema",
+            description="变更后的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+        ),
+    ]
+    instance: Any = Field(
+        ...,
+        title="JSON 实例",
+        description="待在两版 schema 上分别校验的同一个 JSON 实例。",
+    )
+    max_evaluations: int | None = Field(
+        default=None,
+        ge=2,
+        le=HARD_MAX_EVALUATIONS,
+        description=(
+            "最大校验评估次数；每个候选需旧版、新版各校验一次（共 2 次），"
+            "故最小值为 2。"
+            f"默认 {DEFAULT_MAX_EVALUATIONS}，硬上限 {HARD_MAX_EVALUATIONS}。"
+        ),
+    )
+
+
+@app.post("/schema-diff")
+def schema_diff(req: SchemaDiffRequest) -> JSONResponse:
+    max_evaluations = (
+        req.max_evaluations
+        if req.max_evaluations is not None
+        else DEFAULT_MAX_EVALUATIONS
+    )
+
+    # 任一 schema 自身不合法：返回 422，并标明是哪一版。
+    for side, schema in (("old", req.old_schema), ("new", req.new_schema)):
+        try:
+            build_validator(schema)
+        except SchemaError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "invalid_schema",
+                    "side": side,
+                    "message": exc.message,
+                    "path": list(exc.absolute_path),
+                },
+            )
+
+    old_validator = build_validator(req.old_schema)
+    new_validator = build_validator(req.new_schema)
+    differ = SchemaDiffMinimizer(
+        old_validator, new_validator, req.instance, max_evaluations
+    )
+
+    try:
+        result = differ.run()
+    except SchemaUnusable as exc:
+        # schema 能通过元校验，但连一次完整校验都无法运行（坏 $ref 等）。
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "side": exc.side,
+                "message": f"schema 无法用于校验: {exc.original}",
+                "path": [],
+            },
+        )
     return JSONResponse(status_code=200, content=result.to_dict())

@@ -52,6 +52,15 @@ class BudgetExhausted(Exception):
     """评估次数预算耗尽（内部控制流异常）。"""
 
 
+class SchemaUnusable(Exception):
+    """schema 能通过元校验，但实际执行一次校验时即失败（坏 $ref / 非法正则等）。"""
+
+    def __init__(self, side: str, original: Exception):
+        self.side = side
+        self.original = original
+        super().__init__(f"{side}: {original}")
+
+
 # 锁定前的哨兵目标：任何实际关键字（含 None）都不会与它相等。
 _UNLOCKED = object()
 
@@ -228,32 +237,45 @@ class Minimizer:
 
     # ---- 校验 / 预算 -----------------------------------------------------
 
-    def _first_error(self, instance: Any):
-        # iter_errors 按 schema/instance 的固定遍历顺序深度优先产出错误，
-        # 结合锁定的依赖版本，结果完全确定。
-        return next(iter(self.validator.iter_errors(instance)), None)
-
-    def evaluate(self, candidate: Any, op: str, path: tuple, detail: str) -> tuple[Any, bool]:
-        """评估一次候选，记录轨迹；命中预算则抛出 ``BudgetExhausted``。
-
-        返回 ``(首个错误对象或 None, 是否仍触发已锁定关键字)``。
-        锁定（lock）阶段第二个值恒为 False。
-        """
+    def _spend(self) -> None:
+        """消耗一次完整 JSON 校验的评估配额；耗尽则抛 ``BudgetExhausted``。"""
         if self.evaluations >= self.max_evaluations:
             self.stopped_by_budget = True
             raise BudgetExhausted()
         self.evaluations += 1
+
+    def _first_error(self, instance: Any, validator=None):
+        # iter_errors 按 schema/instance 的固定遍历顺序深度优先产出错误，
+        # 结合锁定的依赖版本，结果完全确定。
+        validator = self.validator if validator is None else validator
+        return next(iter(validator.iter_errors(instance)), None)
+
+    def _is_kept(self, err: Any) -> bool:
+        """有趣性判据：候选的首个错误是否仍命中锁定关键字。
+
+        子类（如双 schema 差异最小化）可覆盖为其他保持条件。
+        """
+        return (
+            err is not None
+            and self.target_keyword is not _UNLOCKED
+            and err.validator == self.target_keyword
+        )
+
+    def evaluate(self, candidate: Any, op: str, path: tuple, detail: str) -> tuple[Any, bool]:
+        """评估一次候选，记录轨迹；命中预算则抛出 ``BudgetExhausted``。
+
+        返回 ``(首个错误对象或 None, 是否满足有趣性)``。
+        锁定（lock）阶段第二个值恒为 False。
+        """
+        self._spend()
         err = self._first_error(candidate)
         index = self.evaluations
+        kept = self._is_kept(err)
         if err is None:
             self.trace.append(
                 TraceEntry(index, op, pointer_from_path(path), detail, False)
             )
             return None, False
-        kept = (
-            self.target_keyword is not _UNLOCKED
-            and err.validator == self.target_keyword
-        )
         self.trace.append(
             TraceEntry(
                 index,
@@ -476,3 +498,212 @@ class Minimizer:
         else:
             where = f"{target} indices {chunk[0]}..{chunk[-1]}"
         return f"{action} {where}"
+
+
+# ---- 双 schema 差异见证最小化 ----------------------------------------------
+
+
+def error_info(err: Any) -> dict[str, Any] | None:
+    """把首个校验错误序列化为响应中的 JSON 结构；合法时为 None。"""
+    if err is None:
+        return None
+    return {
+        "keyword": err.validator,
+        "instance_path": pointer_from_path(tuple(err.absolute_path)),
+        "schema_path": pointer_from_path(tuple(err.absolute_schema_path)),
+        "message": err.message,
+    }
+
+
+@dataclass
+class DiffTraceEntry:
+    """单次候选评估（同时校验新旧两版 schema）的轨迹记录。"""
+
+    index: int
+    op: str
+    path: str
+    detail: str
+    kept: bool
+    old_valid: bool
+    new_valid: bool
+    old_keyword: str | None = None
+    new_keyword: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "op": self.op,
+            "path": self.path,
+            "detail": self.detail,
+            "kept": self.kept,
+            "old_valid": self.old_valid,
+            "new_valid": self.new_valid,
+            "old_keyword": self.old_keyword,
+            "new_keyword": self.new_keyword,
+        }
+
+
+@dataclass
+class SchemaDiffResult:
+    reduced_instance: Any
+    original_instance: Any
+    differs: bool
+    direction: str | None
+    old_valid: bool
+    new_valid: bool
+    old_first_error: dict | None
+    new_first_error: dict | None
+    evaluations: int
+    stopped_by_budget: bool
+    trace: list = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reduced_instance": self.reduced_instance,
+            "original_instance": self.original_instance,
+            "differs": self.differs,
+            "direction": self.direction,
+            "old_valid": self.old_valid,
+            "new_valid": self.new_valid,
+            "old_first_error": self.old_first_error,
+            "new_first_error": self.new_first_error,
+            "evaluations": self.evaluations,
+            "stopped_by_budget": self.stopped_by_budget,
+            "trace": [entry.to_dict() for entry in self.trace],
+        }
+
+
+class SchemaDiffMinimizer(Minimizer):
+    """对 (old_schema, new_schema, instance) 做差异见证最小化。
+
+    有趣性不再是"仍触发同一关键字"，而是"新旧两版的通过/拒绝组合与原始
+    组合完全一致"——即候选必须保持两版结果仍然相反。缩减算子（坍缩 /
+    标量阶梯 / ddmin / 递归不动点）与预算记账全部沿用 :class:`Minimizer`。
+
+    每个候选需要执行两次完整 JSON 校验（旧版、新版各一次），各计 1 次
+    评估；首次锁定校验同样消耗 2 次评估。
+    """
+
+    def __init__(self, old_validator, new_validator, instance: Any, max_evaluations: int):
+        super().__init__(None, instance, max_evaluations)
+        self.old_validator = old_validator
+        self.new_validator = new_validator
+        # 锁定的目标组合 (old_valid, new_valid)；结果相反时才进入缩减。
+        self.target_pair: tuple[bool, bool] | None = None
+        # 当前 root 最近一次校验得到的错误对（lock 后初始化，接受候选时更新）。
+        self.root_old_err: Any = None
+        self.root_new_err: Any = None
+
+    # ---- 校验 / 预算（每次评估 = 旧版 + 新版各一次完整校验）----------------
+
+    def _check_side(self, validator, candidate: Any, side: str):
+        try:
+            return self._first_error(candidate, validator)
+        except BudgetExhausted:
+            raise
+        except Exception as exc:
+            # schema 已通过 check_schema，但实际校验对该实例无法运行
+            # （坏 $ref、非法正则等）：按不可用 schema 处理。
+            raise SchemaUnusable(side, exc) from exc
+
+    def evaluate(self, candidate: Any, op: str, path: tuple, detail: str) -> tuple[Any, bool]:
+        """返回 ``((旧版首个错误或 None, 新版首个错误或 None), 是否保持差异组合)``。"""
+        self._spend()
+        old_err = self._check_side(self.old_validator, candidate, "old")
+        self._spend()
+        new_err = self._check_side(self.new_validator, candidate, "new")
+        kept = self._is_kept((old_err, new_err))
+        if kept:
+            self.root_old_err = old_err
+            self.root_new_err = new_err
+        self.trace.append(
+            DiffTraceEntry(
+                # index 记的是候选序号（每候选两次评估），evaluations 另计总额。
+                len(self.trace) + 1,
+                op,
+                pointer_from_path(path),
+                detail,
+                kept,
+                old_err is None,
+                new_err is None,
+                old_err.validator if old_err is not None else None,
+                new_err.validator if new_err is not None else None,
+            )
+        )
+        return (old_err, new_err), kept
+
+    def _is_kept(self, errs: Any) -> bool:
+        if self.target_pair is None:
+            return False
+        (old_err, new_err) = errs
+        return (old_err is None, new_err is None) == self.target_pair
+
+    # ---- 主流程 -----------------------------------------------------------
+
+    def lock_pair(self) -> tuple[Any, Any]:
+        """前 2 次评估：在原实例上分别校验旧版与新版，锁定通过/拒绝组合。"""
+        self._spend()
+        old_err = self._check_side(self.old_validator, self.root, "old")
+        self._spend()
+        new_err = self._check_side(self.new_validator, self.root, "new")
+        self.target_pair = (old_err is None, new_err is None)
+        self.target_keyword = None  # 差异最小化不使用关键字锁。
+        self.root_old_err = old_err
+        self.root_new_err = new_err
+        return old_err, new_err
+
+    @staticmethod
+    def _direction(old_valid: bool, new_valid: bool) -> str | None:
+        if old_valid and not new_valid:
+            # 旧版接受、新版拒绝：新版本更严格。
+            return "newly_rejected"
+        if not old_valid and new_valid:
+            # 旧版拒绝、新版接受：新版本更宽松。
+            return "newly_accepted"
+        return None
+
+    def run(self) -> SchemaDiffResult:
+        old_err, new_err = self.lock_pair()
+        old_valid, new_valid = self.target_pair
+
+        if old_valid == new_valid:
+            # 两版结果相同：不存在差异，不做任何缩减。
+            return SchemaDiffResult(
+                reduced_instance=self.original,
+                original_instance=self.original,
+                differs=False,
+                direction=None,
+                old_valid=old_valid,
+                new_valid=new_valid,
+                old_first_error=error_info(old_err),
+                new_first_error=error_info(new_err),
+                evaluations=self.evaluations,
+                stopped_by_budget=False,
+                trace=self.trace,
+            )
+
+        while True:
+            changed_holder = [False]
+            try:
+                self._visit((), changed_holder)
+            except BudgetExhausted:
+                break
+            if not changed_holder[0]:
+                break
+
+        # 终态错误即当前 root 最近一次被接受候选的错误对（无需额外评估）。
+        final_old_err = self.root_old_err
+        final_new_err = self.root_new_err
+        return SchemaDiffResult(
+            reduced_instance=self.root,
+            original_instance=self.original,
+            differs=True,
+            direction=self._direction(final_old_err is None, final_new_err is None),
+            old_valid=final_old_err is None,
+            new_valid=final_new_err is None,
+            old_first_error=error_info(final_old_err),
+            new_first_error=error_info(final_new_err),
+            evaluations=self.evaluations,
+            stopped_by_budget=self.stopped_by_budget,
+            trace=self.trace,
+        )
